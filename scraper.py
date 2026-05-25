@@ -57,10 +57,16 @@ async def download_image(url: str) -> bytes | None:
 
 
 async def fetch_posts_from_json(
-    subreddit_name: str, limit: int, sort: str, after: str | None = None
+    subreddit_name: str,
+    limit: int,
+    sort: str,
+    after: str | None = None,
+    top_time: str = "all",
 ):
     """Fetches a page of subreddit posts from Reddit's public JSON endpoint."""
     url = f"https://www.reddit.com/r/{subreddit_name}/{sort}.json?limit={limit}"
+    if sort == "top":
+        url = f"{url}&t={top_time}"
     if after:
         url = f"{url}&after={after}"
     headers = {"User-Agent": "Mozilla/5.0 (compatible; RedditDownloader/1.0)"}
@@ -195,7 +201,11 @@ def crop_and_save_image(
 
 
 async def process_subreddit(
-    subreddit_name: str, limit: int, sort: str, output_dir: Path
+    subreddit_name: str,
+    limit: int,
+    sort: str,
+    output_dir: Path,
+    top_time: str = "all",
 ):
     """Fetches posts, filters for images, processes, and saves them."""
 
@@ -208,7 +218,7 @@ async def process_subreddit(
     while saved_images < limit:
         # Fetch another page of posts until we have enough saved images.
         post_children, after = await fetch_posts_from_json(
-            subreddit_name, 100, sort, after
+            subreddit_name, 100, sort, after, top_time
         )
 
         if not post_children:
@@ -274,6 +284,13 @@ async def main():
         help="The sorting method for posts (default: hot).",
     )
     parser.add_argument(
+        "--time",
+        type=str,
+        default="all",
+        choices=["hour", "day", "week", "month", "year", "all"],
+        help="The time range used when --sort top is selected (default: all).",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="./output_images",
@@ -288,7 +305,9 @@ async def main():
 
     try:
         # 2. Process the subreddit
-        await process_subreddit(args.subreddit, args.limit, args.sort, output_path)
+        await process_subreddit(
+            args.subreddit, args.limit, args.sort, output_path, args.time
+        )
         logger.info("--- Scraping and processing complete! ---")
 
     except Exception as e:

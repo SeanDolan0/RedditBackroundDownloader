@@ -24,7 +24,13 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\\Users\\sedol\\Desktop\\BackroundImmages"
+python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\\Users\\[User]]\\Desktop\\BackroundImmages"
+```
+
+For top listings, you can also choose a time window:
+
+```bash
+python scraper.py --subreddit EarthPorn --limit 100 --sort top --time all --output "C:\\Users\\[User]\\Desktop\\BackroundImmages"
 ```
 
 ## Arguments
@@ -32,6 +38,7 @@ python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\\Use
 - `--subreddit`: Subreddit name to scrape
 - `--limit`: Number of final images to save
 - `--sort`: One of `hot`, `new`, or `top`
+- `--time`: Time window for `top` results: `hour`, `day`, `week`, `month`, `year`, or `all`
 - `--output`: Destination folder for saved images
 
 ## Notes
