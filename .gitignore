@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets
+.env
+
+# Generated output
+Output/
+output_images/
+
+# Editor files
+.vscode/
+.idea/
