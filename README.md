@@ -1,4 +1,4 @@
-# Reddit Downloader
+# Reddit Backround Downloader
 
 A small Python CLI tool that downloads and crops high-resolution Reddit images to a 16:9 wallpaper-friendly format.
 
