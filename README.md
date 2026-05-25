@@ -24,7 +24,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\\Users\\sedol\\Desktop\\BackroundImmages"
+python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\\Users\\[User]\\Desktop\\BackroundImmages"
 ```
 
 ## Arguments
