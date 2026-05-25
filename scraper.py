@@ -295,19 +295,19 @@ async def process_subreddit(
                 logger.info("Reached the end of the subreddit listing.")
                 break
 
-            # Summary
-            elapsed = time.time() - start_time
-            print("\n=== Summary ===")
-            print(f"Elapsed time: {elapsed:.1f}s")
-            print(f"Pages fetched: {counters['pages_fetched']}")
-            print(f"Posts seen: {counters['posts_seen']}")
-            print(f"Image candidates: {counters['image_candidates']}")
-            print(f"Downloaded failures: {counters['download_failures']}")
-            print(f"Saved: {counters['saved']}")
-            print(f"Skipped (too small): {counters['skipped_too_small']}")
-            print(f"Skipped (no image): {counters['skipped_no_image']}")
-            print(f"Processing errors: {counters['processing_errors']}")
-            print("============\n")
+        # Summary (printed once after processing finishes)
+        elapsed = time.time() - start_time
+        print("\n=== Summary ===")
+        print(f"Elapsed time: {elapsed:.1f}s")
+        print(f"Pages fetched: {counters['pages_fetched']}")
+        print(f"Posts seen: {counters['posts_seen']}")
+        print(f"Image candidates: {counters['image_candidates']}")
+        print(f"Downloaded failures: {counters['download_failures']}")
+        print(f"Saved: {counters['saved']}")
+        print(f"Skipped (too small): {counters['skipped_too_small']}")
+        print(f"Skipped (no image): {counters['skipped_no_image']}")
+        print(f"Processing errors: {counters['processing_errors']}")
+        print("============\n")
 
 
 async def main():
