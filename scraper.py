@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+import time
 from PIL import Image
 from tqdm.asyncio import tqdm
 
@@ -136,7 +137,7 @@ def sanitize_filename(text: str, max_length: int = 80) -> str:
 
 def crop_and_save_image(
     image_bytes: bytes, output_path: Path, post_title: str, post_id: str | None = None
-) -> bool:
+) -> tuple[bool, str]:
     """
     Processes the downloaded image: centers and crops it to 16:9 while enforcing
     a minimum resolution guardrail.
@@ -173,10 +174,10 @@ def crop_and_save_image(
 
         # 3. Apply Resolution Guardrail
         if new_width < MIN_WIDTH or new_height < MIN_HEIGHT:
-            logger.info(
+            logger.debug(
                 f"SKIP: Cropped dimensions ({int(new_width)}x{int(new_height)}) are below the minimum resolution guardrail ({MIN_WIDTH}x{MIN_HEIGHT})."
             )
-            return False
+            return False, "too_small"
 
         # 4. Perform the crop
         cropped_image = image.crop((left, top, right, bottom))
@@ -189,15 +190,15 @@ def crop_and_save_image(
         )
         save_path = output_path / filename
         cropped_image.save(save_path)
-        logger.info(f"SUCCESS: Saved image to {save_path}")
-        return True
+        logger.debug(f"SUCCESS: Saved image to {save_path}")
+        return True, "saved"
 
     except ValueError as e:
         logger.error(f"Processing error (likely bad image format): {e}")
-        return False
+        return False, "format_error"
     except Exception as e:
         logger.error(f"An unexpected error occurred during image processing: {e}")
-        return False
+        return False, "error"
 
 
 async def process_subreddit(
@@ -215,11 +216,34 @@ async def process_subreddit(
     after = None
     seen_post_ids: set[str] = set()
 
+    # Counters for summary
+    counters = {
+        "pages_fetched": 0,
+        "posts_seen": 0,
+        "image_candidates": 0,
+        "download_failures": 0,
+        "saved": 0,
+        "skipped_too_small": 0,
+        "skipped_no_image": 0,
+        "processing_errors": 0,
+    }
+
+    # Header
+    header = (
+        f"=== Reddit Downloader: r/{subreddit_name}  sort={sort}"
+        + (f" time={top_time}" if sort == "top" else "")
+        + f"  target={limit} images ==="
+    )
+    print("\n" + header)
+    print("Starting... this may take a few minutes.\n")
+    start_time = time.time()
+
     while saved_images < limit:
         # Fetch another page of posts until we have enough saved images.
         post_children, after = await fetch_posts_from_json(
             subreddit_name, 100, sort, after, top_time
         )
+        counters["pages_fetched"] += 1
 
         if not post_children:
             logger.info("No more posts available from Reddit.")
@@ -227,6 +251,7 @@ async def process_subreddit(
 
         for post_data in tqdm(post_children, desc="Processing posts"):
             post = post_data.get("data", {})  # 'data' holds the actual post object
+            counters["posts_seen"] += 1
             post_id = post.get("id")
             if post_id and post_id in seen_post_ids:
                 continue
@@ -236,7 +261,9 @@ async def process_subreddit(
             # Filter: Resolve a direct image URL from common Reddit image fields.
             image_url = resolve_image_url(post)
             if not image_url:
+                counters["skipped_no_image"] += 1
                 continue
+            counters["image_candidates"] += 1
 
             post_title = post.get("title", "UntitledPost")
             post_id = post.get("id")
@@ -244,19 +271,43 @@ async def process_subreddit(
             # Download the image bytes
             image_bytes = await download_image(image_url)
             if image_bytes is None:
+                counters["download_failures"] += 1
                 continue
 
             # Process and save the image
-            if crop_and_save_image(image_bytes, output_dir, post_title, post_id):
+            ok, reason = crop_and_save_image(
+                image_bytes, output_dir, post_title, post_id
+            )
+            if ok and reason == "saved":
                 saved_images += 1
+                counters["saved"] += 1
                 logger.info(f"Saved {saved_images}/{limit} images.")
+            else:
+                if reason == "too_small":
+                    counters["skipped_too_small"] += 1
+                else:
+                    counters["processing_errors"] += 1
 
             if saved_images >= limit:
                 break
 
-        if not after:
-            logger.info("Reached the end of the subreddit listing.")
-            break
+            if not after:
+                logger.info("Reached the end of the subreddit listing.")
+                break
+
+            # Summary
+            elapsed = time.time() - start_time
+            print("\n=== Summary ===")
+            print(f"Elapsed time: {elapsed:.1f}s")
+            print(f"Pages fetched: {counters['pages_fetched']}")
+            print(f"Posts seen: {counters['posts_seen']}")
+            print(f"Image candidates: {counters['image_candidates']}")
+            print(f"Downloaded failures: {counters['download_failures']}")
+            print(f"Saved: {counters['saved']}")
+            print(f"Skipped (too small): {counters['skipped_too_small']}")
+            print(f"Skipped (no image): {counters['skipped_no_image']}")
+            print(f"Processing errors: {counters['processing_errors']}")
+            print("============\n")
 
 
 async def main():
