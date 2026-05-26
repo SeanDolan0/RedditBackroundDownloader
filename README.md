@@ -27,19 +27,19 @@ pip install -r requirements.txt
 Basic run:
 
 ```bash
-python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\Users\sedol\Desktop\Backround Immages"
+python scraper.py --subreddit EarthPorn --limit 100 --sort hot --output "C:\Users\[User]\Desktop\Backround Immages"
 ```
 
 Top posts across all time:
 
 ```bash
-python scraper.py --subreddit EarthPorn --limit 20 --sort top --time all --output "C:\Users\sedol\Desktop\Backround Immages"
+python scraper.py --subreddit EarthPorn --limit 20 --sort top --time all --output "C:\Users\[User]\Desktop\Backround Immages"
 ```
 
 Use a simple center crop instead of smart cropping:
 
 ```bash
-python scraper.py --subreddit EarthPorn --limit 20 --sort hot --crop-mode center --output "C:\Users\sedol\Desktop\Backround Immages"
+python scraper.py --subreddit EarthPorn --limit 20 --sort hot --crop-mode center --output "C:\Users\[User]\Desktop\Backround Immages"
 ```
 
 ## CLI Options
