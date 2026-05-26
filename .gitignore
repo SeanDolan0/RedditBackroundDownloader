@@ -3,19 +3,51 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
 
 # Virtual environments
 .venv/
 venv/
 env/
+ENV/
+virtualenv/
 
-# Local secrets
-.env
-
-# Generated output
-Output/
-output_images/
-
-# Editor files
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local configuration
+.env
+.env.local
+.env.*.local
+
+# Generated output
+output_images/
+Output/
+wallpapers/
+downloads/
+
+# Session/temporary files
+.omo
+.opencode
+.session
+
+# OS files
+Thumbs.db
+*.lnk
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Logs
+*.log

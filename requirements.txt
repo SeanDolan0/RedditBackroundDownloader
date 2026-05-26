@@ -1,4 +1,5 @@
 httpx
 numpy
 opencv-python
-tqdm
+rich
+questionary

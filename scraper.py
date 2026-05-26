@@ -9,7 +9,10 @@ from urllib.parse import urlparse
 import httpx
 import cv2
 import numpy as np
-from tqdm.asyncio import tqdm
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
 
 # --- Configuration Constants ---
 # Target aspect ratio: 16:9
@@ -19,11 +22,16 @@ MIN_WIDTH = 2560
 MIN_HEIGHT = 1440
 # -------------------------------
 
-# Setup logging
+# Setup logging and rich console
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.WARNING,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+# Suppress httpx INFO logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+console = Console()
 
 REDDIT_IMAGE_HOSTS = {
     "i.redd.it",
@@ -35,6 +43,77 @@ REDDIT_IMAGE_HOSTS = {
 FACE_CASCADE_FILENAME = "haarcascade_frontalface_default.xml"
 
 
+# --- Rich Output Helpers ---
+def print_welcome():
+    """Print welcome message with project info."""
+    title = Text("Reddit Background Downloader", style="bold cyan")
+    console.print(Panel(title, expand=False, border_style="cyan"))
+
+
+def print_config(subreddit: str, limit: int, sort: str, time_filter: str, crop_mode: str, output_dir: str):
+    """Print configuration table."""
+    table = Table(title="⚙️  Configuration", show_header=False, box=None)
+    table.add_column(style="cyan", width=15)
+    table.add_column(style="white")
+    
+    table.add_row("Subreddit:", f"r/{subreddit}")
+    table.add_row("Target images:", str(limit))
+    table.add_row("Sort by:", sort)
+    if sort == "top":
+        table.add_row("Time range:", time_filter)
+    table.add_row("Crop mode:", crop_mode)
+    table.add_row("Output:", output_dir)
+    
+    console.print(table)
+
+
+def print_summary(counters: dict, elapsed: float):
+    """Print formatted summary table."""
+    table = Table(title="📊 Summary", show_header=False, box=None)
+    table.add_column(style="cyan", width=25)
+    table.add_column(style="yellow")
+    
+    table.add_row("Elapsed time:", f"{elapsed:.1f}s")
+    table.add_row("Pages fetched:", str(counters['pages_fetched']))
+    table.add_row("Posts seen:", str(counters['posts_seen']))
+    table.add_row("Image candidates found:", str(counters['image_candidates']))
+    table.add_row("Download failures:", str(counters['download_failures']))
+    table.add_row("✅ Successfully saved:", f"[green]{counters['saved']}[/green]")
+    table.add_row("⏭️  Skipped (too small):", str(counters['skipped_too_small']))
+    table.add_row("⏭️  Skipped (no image):", str(counters['skipped_no_image']))
+    table.add_row("❌ Processing errors:", str(counters['processing_errors']))
+    
+    console.print(table)
+
+
+def print_status(message: str, status_type: str = "info"):
+    """Print status message with icon."""
+    if status_type == "success":
+        console.print(f"[green]✓[/green] {message}")
+    elif status_type == "error":
+        console.print(f"[red]✗[/red] {message}")
+    elif status_type == "warning":
+        console.print(f"[yellow]⚠[/yellow] {message}")
+    elif status_type == "info":
+        console.print(f"[cyan]ℹ[/cyan] {message}")
+
+
+def print_error(title: str, message: str):
+    """Print error message in a panel."""
+    error_panel = Panel(message, title=title, border_style="red", style="red")
+    console.print(error_panel)
+
+
+def print_processing_status(saved_count: int, target_count: int, current_page: int):
+    """Print a clean processing status line."""
+    percent = (saved_count / target_count) * 100
+    bar_length = 30
+    filled = int(bar_length * saved_count / target_count)
+    bar = "█" * filled + "░" * (bar_length - filled)
+    status = f"[cyan]Downloading images...[/cyan] {bar} {saved_count}/{target_count} (Page {current_page})"
+    console.print(status)
+
+
 # Removed PRAW/AsyncPRAW dependencies and .env loading.
 # The script now relies on direct HTTP requests to the public JSON endpoint.
 # The credential checks and PRAW initialization are replaced by basic logging.
@@ -44,18 +123,17 @@ FACE_CASCADE_FILENAME = "haarcascade_frontalface_default.xml"
 async def download_image(url: str) -> bytes | None:
     """Downloads an image from a URL using httpx."""
     try:
-        # Use httpx with a timeout for robustness
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=20.0)
         ) as client:
             response = await client.get(url)
             response.raise_for_status()
             return response.content
-    except httpx.HTTPError as e:
-        logger.warning(f"Network error downloading {url}: {e}")
+    except httpx.HTTPStatusError as e:
         return None
-    except Exception as e:
-        logger.error(f"An unexpected error occurred while downloading {url}: {e}")
+    except httpx.HTTPError:
+        return None
+    except Exception:
         return None
 
 
@@ -83,13 +161,7 @@ async def fetch_posts_from_json(
             payload = response.json()
             data = payload.get("data", {})
             return data.get("children", []), data.get("after")
-    except httpx.HTTPError as e:
-        logger.warning(f"Network error fetching posts from r/{subreddit_name}: {e}")
-        return [], None
-    except Exception as e:
-        logger.error(
-            f"An unexpected error occurred while fetching posts from r/{subreddit_name}: {e}"
-        )
+    except Exception:
         return [], None
 
 
@@ -289,35 +361,27 @@ def crop_and_save_image(
                 image, TARGET_ASPECT_RATIO, face_cascade
             )
 
-        # 3. Apply Resolution Guardrail
+        # Apply Resolution Guardrail
         if crop_w < MIN_WIDTH or crop_h < MIN_HEIGHT:
-            logger.debug(
-                f"SKIP: Cropped dimensions ({int(crop_w)}x{int(crop_h)}) are below the minimum resolution guardrail ({MIN_WIDTH}x{MIN_HEIGHT})."
-            )
             return False, "too_small"
 
-        # 4. Perform the crop
+        # Perform the crop
         cropped_image = image[start_y : start_y + crop_h, start_x : start_x + crop_w]
 
         if cropped_image.size == 0:
             raise ValueError("Cropping resulted in an empty image.")
 
-        # 5. Save the image
+        # Save the image
         safe_title = sanitize_filename(post_title)
         id_suffix = f"_{post_id}" if post_id else ""
         filename = f"{safe_title[:50]}{id_suffix}_{int(crop_w)}x{int(crop_h)}.jpg"
         save_path = output_path / filename
         cv2.imwrite(str(save_path), cropped_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        logger.debug(
-            f"SUCCESS: Saved image to {save_path} (faces_detected={face_count})"
-        )
         return True, "saved"
 
-    except ValueError as e:
-        logger.error(f"Processing error (likely bad image format): {e}")
+    except ValueError:
         return False, "format_error"
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during image processing: {e}")
+    except Exception:
         return False, "error"
 
 
@@ -331,17 +395,15 @@ async def process_subreddit(
 ):
     """Fetches posts, filters for images, processes, and saves them."""
 
-    logger.info(f"Starting scraper for r/{subreddit_name}...")
-
     saved_images = 0
     after = None
     seen_post_ids: set[str] = set()
     face_cascade = load_face_cascade()
 
     if face_cascade is None:
-        logger.info("Face detection unavailable; using saliency-only crop guidance.")
+        print_status("Face detection unavailable; using saliency-only crop guidance.", "warning")
     else:
-        logger.info("Face detection enabled for content-aware cropping.")
+        print_status("Face detection enabled for content-aware cropping.", "success")
 
     # Counters for summary
     counters = {
@@ -355,14 +417,10 @@ async def process_subreddit(
         "processing_errors": 0,
     }
 
-    # Header
-    header = (
-        f"=== Reddit Downloader: r/{subreddit_name}  sort={sort}"
-        + (f" time={top_time}" if sort == "top" else "")
-        + f"  target={limit} images ==="
-    )
-    print("\n" + header)
-    print("Starting... this may take a few minutes.\n")
+    # Print configuration
+    print_config(subreddit_name, limit, sort, top_time, crop_mode, str(output_dir))
+    
+    console.print("\n[cyan]Processing... this may take a few minutes.[/cyan]\n")
     start_time = time.time()
 
     while saved_images < limit:
@@ -373,11 +431,12 @@ async def process_subreddit(
         counters["pages_fetched"] += 1
 
         if not post_children:
-            logger.info("No more posts available from Reddit.")
+            print_status("No more posts available from Reddit.", "warning")
             break
 
-        for post_data in tqdm(post_children, desc="Processing posts"):
-            post = post_data.get("data", {})  # 'data' holds the actual post object
+        # Process posts without verbose progress bar
+        for post_data in post_children:
+            post = post_data.get("data", {})
             counters["posts_seen"] += 1
             post_id = post.get("id")
             if post_id and post_id in seen_post_ids:
@@ -413,7 +472,8 @@ async def process_subreddit(
             if ok and reason == "saved":
                 saved_images += 1
                 counters["saved"] += 1
-                logger.info(f"Saved {saved_images}/{limit} images.")
+                # Print clean save message
+                print_status(f"Saved image {saved_images}/{limit}", "success")
             else:
                 if reason == "too_small":
                     counters["skipped_too_small"] += 1
@@ -424,40 +484,144 @@ async def process_subreddit(
                 break
 
             if not after:
-                logger.info("Reached the end of the subreddit listing.")
+                print_status("Reached the end of the subreddit listing.", "warning")
                 break
 
-    # Summary (printed once after processing finishes)
+    # Summary
     elapsed = time.time() - start_time
-    print("\n=== Summary ===")
-    print(f"Elapsed time: {elapsed:.1f}s")
-    print(f"Pages fetched: {counters['pages_fetched']}")
-    print(f"Posts seen: {counters['posts_seen']}")
-    print(f"Image candidates: {counters['image_candidates']}")
-    print(f"Downloaded failures: {counters['download_failures']}")
-    print(f"Saved: {counters['saved']}")
-    print(f"Skipped (too small): {counters['skipped_too_small']}")
-    print(f"Skipped (no image): {counters['skipped_no_image']}")
-    print(f"Processing errors: {counters['processing_errors']}")
-    print("============\n")
+    print("\n")
+    print_summary(counters, elapsed)
 
 
-async def main():
-    """Main entry point for the CLI tool."""
+def run_interactive_mode():
+    """Run interactive mode to collect user input."""
+    try:
+        import questionary
+    except ImportError:
+        print_error("Missing Dependency", "questionary not installed. Run: pip install -r requirements.txt")
+        return None
+
+    console.print("[cyan]Answer a few questions to get started:[/cyan]\n")
+    
+    subreddit = questionary.text(
+        "Subreddit name (without r/)?",
+        default="EarthPorn"
+    ).ask()
+    
+    if not subreddit:
+        print_error("Error", "Subreddit name is required.")
+        return None
+
+    limit = questionary.text(
+        "How many images to download?",
+        default="50"
+    ).ask()
+    
+    try:
+        limit = int(limit)
+    except ValueError:
+        print_error("Error", "Limit must be a number.")
+        return None
+
+    sort = questionary.select(
+        "Sort posts by?",
+        choices=["hot", "new", "top"],
+        default="hot"
+    ).ask()
+
+    time_filter = "all"
+    if sort == "top":
+        time_filter = questionary.select(
+            "Time range?",
+            choices=["hour", "day", "week", "month", "year", "all"],
+            default="all"
+        ).ask()
+
+    crop_mode = questionary.select(
+        "Crop mode?",
+        choices=["smart (saliency + face detection)", "center (simple center crop)"],
+        default="smart (saliency + face detection)"
+    ).ask()
+    crop_mode = "smart" if "smart" in crop_mode else "center"
+
+    output = questionary.text(
+        "Output folder?",
+        default="./output_images"
+    ).ask()
+
+    console.print()
+    
+    return {
+        "subreddit": subreddit,
+        "limit": limit,
+        "sort": sort,
+        "time": time_filter,
+        "crop_mode": crop_mode,
+        "output": output,
+    }
+
+
+async def main(
+    subreddit: str,
+    limit: int,
+    sort: str,
+    time_filter: str,
+    crop_mode: str,
+    output: str,
+):
+    """Main async function that processes the subreddit."""
+    # Setup output directory
+    output_path = Path(output)
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print_error("Error", f"Could not create output directory: {e}")
+        return
+
+    try:
+        # Process the subreddit
+        await process_subreddit(
+            subreddit,
+            limit,
+            sort,
+            output_path,
+            time_filter,
+            crop_mode,
+        )
+        print_status("Scraping and processing complete!", "success")
+
+    except Exception as e:
+        print_error("Critical Error", f"An unexpected error occurred: {e}")
+        logger.critical(f"A critical error occurred during the scraping process: {e}")
+
+
+def cli_main():
+    """Synchronous entry point that handles CLI parsing and interactive mode."""
     parser = argparse.ArgumentParser(
-        description="Scrape, center-crop, and save high-resolution images from a Reddit subreddit using the public JSON endpoint."
+        description="Scrape, crop, and save high-resolution images from Reddit using the public JSON endpoint.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python scraper.py --subreddit EarthPorn --limit 20 --sort hot
+  python scraper.py --subreddit EarthPorn --limit 20 --sort top --time all
+  python scraper.py -i  (interactive mode)
+        """
+    )
+    parser.add_argument(
+        "-i", "--interactive",
+        action="store_true",
+        help="Launch interactive mode for guided setup.",
     )
     parser.add_argument(
         "--subreddit",
         type=str,
-        required=True,
-        help="The name of the subreddit to scrape (e.g., 'reactjs').",
+        help="The name of the subreddit to scrape (e.g., 'EarthPorn').",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=50,
-        help="The number of posts to fetch (default: 50).",
+        help="The number of images to save (default: 50).",
     )
     parser.add_argument(
         "--sort",
@@ -484,30 +648,40 @@ async def main():
         type=str,
         default="smart",
         choices=["smart", "center"],
-        help="Crop strategy to use: smart saliency-based framing or center crop.",
+        help="Crop strategy: 'smart' uses saliency/face detection, 'center' uses simple center crop (default: smart).",
     )
     args = parser.parse_args()
 
-    # 1. Setup output directory
-    output_path = Path(args.output)
-    output_path.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Output directory set to: {output_path.resolve()}")
+    print_welcome()
 
-    try:
-        # 2. Process the subreddit
-        await process_subreddit(
-            args.subreddit,
-            args.limit,
-            args.sort,
-            output_path,
-            args.time,
-            args.crop_mode,
-        )
-        logger.info("--- Scraping and processing complete! ---")
+    # Handle interactive mode
+    if args.interactive:
+        config = run_interactive_mode()
+        if config is None:
+            return
+        subreddit = config["subreddit"]
+        limit = config["limit"]
+        sort = config["sort"]
+        time_filter = config["time"]
+        crop_mode = config["crop_mode"]
+        output = config["output"]
+    else:
+        # Validate required argument
+        if not args.subreddit:
+            parser.print_help()
+            print_error("Missing Argument", "The --subreddit argument is required.")
+            return
 
-    except Exception as e:
-        logger.critical(f"A critical error occurred during the scraping process: {e}")
+        subreddit = args.subreddit
+        limit = args.limit
+        sort = args.sort
+        time_filter = args.time
+        crop_mode = args.crop_mode
+        output = args.output
+
+    # Run the async main function
+    asyncio.run(main(subreddit, limit, sort, time_filter, crop_mode, output))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli_main()
