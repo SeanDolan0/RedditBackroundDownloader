@@ -1,14 +1,14 @@
 import asyncio
-import io
 import argparse
 import logging
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-import time
-from PIL import Image
+import cv2
+import numpy as np
 from tqdm.asyncio import tqdm
 
 # --- Configuration Constants ---
@@ -31,6 +31,8 @@ REDDIT_IMAGE_HOSTS = {
     "i.imgur.com",
     "imgur.com",
 }
+
+FACE_CASCADE_FILENAME = "haarcascade_frontalface_default.xml"
 
 
 # Removed PRAW/AsyncPRAW dependencies and .env loading.
@@ -135,62 +137,180 @@ def sanitize_filename(text: str, max_length: int = 80) -> str:
     return cleaned_text[:max_length] or "untitled"
 
 
+def get_face_cascade_path() -> str | None:
+    """Return the bundled OpenCV face cascade path if it exists."""
+    bundled_path = Path(cv2.__file__).resolve().parent / "data" / FACE_CASCADE_FILENAME
+    return str(bundled_path) if bundled_path.exists() else None
+
+
+def load_face_cascade() -> cv2.CascadeClassifier | None:
+    """Load the bundled Haar face cascade once for content-aware cropping."""
+    cascade_path = get_face_cascade_path()
+    if not cascade_path:
+        return None
+
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    if face_cascade.empty():
+        return None
+
+    return face_cascade
+
+
+def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
+    """Decode downloaded image bytes into an OpenCV image."""
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("Could not decode image data.")
+    return image
+
+
+def calculate_saliency_map(img: np.ndarray) -> np.ndarray:
+    """Compute a simple saliency map from gradients and contrast."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=5)
+    sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=5)
+    gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
+    return cv2.convertScaleAbs(gradient_magnitude)
+
+
+def detect_faces(
+    img: np.ndarray, face_cascade: cv2.CascadeClassifier
+) -> tuple[np.ndarray, list[tuple[float, float]]]:
+    """Detect faces and return a binary mask plus face centers."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+    )
+
+    face_mask = np.zeros_like(gray, dtype=np.uint8)
+    face_centers = []
+
+    for x, y, w, h in faces:
+        cv2.rectangle(face_mask, (x, y), (x + w, y + h), 255, -1)
+        face_centers.append((x + w / 2, y + h / 2))
+
+    return face_mask, face_centers
+
+
+def calculate_weighted_center_of_mass(
+    saliency_map: np.ndarray, face_mask: np.ndarray
+) -> tuple[int, int]:
+    """Calculate the weighted center of mass from saliency and face masks."""
+    combined_weight = cv2.addWeighted(saliency_map, 0.5, face_mask, 1.5, 0.0)
+
+    height, width = combined_weight.shape[:2]
+    weight_float = combined_weight.astype(np.float32)
+    weighted_sum_x = np.sum(np.arange(width)[None, :] * weight_float)
+    weighted_sum_y = np.sum(np.arange(height)[:, None] * weight_float)
+    total_weight = np.sum(weight_float)
+
+    if total_weight == 0:
+        return width // 2, height // 2
+
+    center_x = int(weighted_sum_x / total_weight)
+    center_y = int(weighted_sum_y / total_weight)
+    return center_x, center_y
+
+
+def calculate_best_crop_box(
+    img: np.ndarray,
+    target_aspect_ratio: float,
+    face_cascade: cv2.CascadeClassifier | None = None,
+) -> tuple[int, int, int, int, int]:
+    """Find a content-aware crop box that preserves the target aspect ratio."""
+    original_height, original_width = img.shape[:2]
+
+    saliency_map = calculate_saliency_map(img)
+
+    if face_cascade is None:
+        face_mask = np.zeros((original_height, original_width), dtype=np.uint8)
+        face_centers: list[tuple[float, float]] = []
+    else:
+        face_mask, face_centers = detect_faces(img, face_cascade)
+
+    center_x, center_y = calculate_weighted_center_of_mass(saliency_map, face_mask)
+
+    if original_width / original_height > target_aspect_ratio:
+        crop_h = original_height
+        crop_w = max(1, int(original_height * target_aspect_ratio))
+    else:
+        crop_w = original_width
+        crop_h = max(1, int(original_width / target_aspect_ratio))
+
+    start_x = center_x - crop_w // 2
+    start_y = center_y - crop_h // 2
+
+    start_x = max(0, min(start_x, original_width - crop_w))
+    start_y = max(0, min(start_y, original_height - crop_h))
+
+    return start_x, start_y, crop_w, crop_h, len(face_centers)
+
+
+def calculate_center_crop_box(
+    img: np.ndarray, target_aspect_ratio: float
+) -> tuple[int, int, int, int]:
+    """Calculate a simple center crop box for comparison or fallback."""
+    original_height, original_width = img.shape[:2]
+
+    if original_width / original_height > target_aspect_ratio:
+        crop_h = original_height
+        crop_w = max(1, int(original_height * target_aspect_ratio))
+    else:
+        crop_w = original_width
+        crop_h = max(1, int(original_width / target_aspect_ratio))
+
+    start_x = max(0, (original_width - crop_w) // 2)
+    start_y = max(0, (original_height - crop_h) // 2)
+    return start_x, start_y, crop_w, crop_h
+
+
 def crop_and_save_image(
-    image_bytes: bytes, output_path: Path, post_title: str, post_id: str | None = None
+    image_bytes: bytes,
+    output_path: Path,
+    post_title: str,
+    post_id: str | None = None,
+    face_cascade: cv2.CascadeClassifier | None = None,
+    crop_mode: str = "smart",
 ) -> tuple[bool, str]:
     """
-    Processes the downloaded image: centers and crops it to 16:9 while enforcing
-    a minimum resolution guardrail.
+    Processes the downloaded image with content-aware cropping for wallpaper use.
     """
     try:
-        # 1. Open image and get dimensions
-        image = Image.open(io.BytesIO(image_bytes))
-        original_width, original_height = image.size
+        image = decode_image_bytes(image_bytes)
+        face_count = 0
 
-        # 2. Determine cropping strategy
-        target_ratio = TARGET_ASPECT_RATIO
-
-        if original_width / original_height > target_ratio:
-            # Image is wider than 16:9 (landscape). Height is limiting.
-            new_height = original_height
-            new_width = int(original_height * target_ratio)
-
-            # Calculate crop box (left, top, right, bottom)
-            left = (original_width - new_width) / 2
-            top = 0
-            right = left + new_width
-            bottom = original_height
-
+        if crop_mode == "center":
+            start_x, start_y, crop_w, crop_h = calculate_center_crop_box(
+                image, TARGET_ASPECT_RATIO
+            )
         else:
-            # Image is taller or perfect 16:9. Width is limiting.
-            new_width = original_width
-            new_height = int(original_width / target_ratio)
-
-            # Calculate crop box
-            left = 0
-            top = (original_height - new_height) / 2
-            right = original_width
-            bottom = top + new_height
+            start_x, start_y, crop_w, crop_h, face_count = calculate_best_crop_box(
+                image, TARGET_ASPECT_RATIO, face_cascade
+            )
 
         # 3. Apply Resolution Guardrail
-        if new_width < MIN_WIDTH or new_height < MIN_HEIGHT:
+        if crop_w < MIN_WIDTH or crop_h < MIN_HEIGHT:
             logger.debug(
-                f"SKIP: Cropped dimensions ({int(new_width)}x{int(new_height)}) are below the minimum resolution guardrail ({MIN_WIDTH}x{MIN_HEIGHT})."
+                f"SKIP: Cropped dimensions ({int(crop_w)}x{int(crop_h)}) are below the minimum resolution guardrail ({MIN_WIDTH}x{MIN_HEIGHT})."
             )
             return False, "too_small"
 
         # 4. Perform the crop
-        cropped_image = image.crop((left, top, right, bottom))
+        cropped_image = image[start_y : start_y + crop_h, start_x : start_x + crop_w]
+
+        if cropped_image.size == 0:
+            raise ValueError("Cropping resulted in an empty image.")
 
         # 5. Save the image
         safe_title = sanitize_filename(post_title)
         id_suffix = f"_{post_id}" if post_id else ""
-        filename = (
-            f"{safe_title[:50]}{id_suffix}_{int(new_width)}x{int(new_height)}.jpg"
-        )
+        filename = f"{safe_title[:50]}{id_suffix}_{int(crop_w)}x{int(crop_h)}.jpg"
         save_path = output_path / filename
-        cropped_image.save(save_path)
-        logger.debug(f"SUCCESS: Saved image to {save_path}")
+        cv2.imwrite(str(save_path), cropped_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        logger.debug(
+            f"SUCCESS: Saved image to {save_path} (faces_detected={face_count})"
+        )
         return True, "saved"
 
     except ValueError as e:
@@ -207,6 +327,7 @@ async def process_subreddit(
     sort: str,
     output_dir: Path,
     top_time: str = "all",
+    crop_mode: str = "smart",
 ):
     """Fetches posts, filters for images, processes, and saves them."""
 
@@ -215,6 +336,12 @@ async def process_subreddit(
     saved_images = 0
     after = None
     seen_post_ids: set[str] = set()
+    face_cascade = load_face_cascade()
+
+    if face_cascade is None:
+        logger.info("Face detection unavailable; using saliency-only crop guidance.")
+    else:
+        logger.info("Face detection enabled for content-aware cropping.")
 
     # Counters for summary
     counters = {
@@ -276,7 +403,12 @@ async def process_subreddit(
 
             # Process and save the image
             ok, reason = crop_and_save_image(
-                image_bytes, output_dir, post_title, post_id
+                image_bytes,
+                output_dir,
+                post_title,
+                post_id,
+                face_cascade,
+                crop_mode,
             )
             if ok and reason == "saved":
                 saved_images += 1
@@ -295,19 +427,19 @@ async def process_subreddit(
                 logger.info("Reached the end of the subreddit listing.")
                 break
 
-        # Summary (printed once after processing finishes)
-        elapsed = time.time() - start_time
-        print("\n=== Summary ===")
-        print(f"Elapsed time: {elapsed:.1f}s")
-        print(f"Pages fetched: {counters['pages_fetched']}")
-        print(f"Posts seen: {counters['posts_seen']}")
-        print(f"Image candidates: {counters['image_candidates']}")
-        print(f"Downloaded failures: {counters['download_failures']}")
-        print(f"Saved: {counters['saved']}")
-        print(f"Skipped (too small): {counters['skipped_too_small']}")
-        print(f"Skipped (no image): {counters['skipped_no_image']}")
-        print(f"Processing errors: {counters['processing_errors']}")
-        print("============\n")
+    # Summary (printed once after processing finishes)
+    elapsed = time.time() - start_time
+    print("\n=== Summary ===")
+    print(f"Elapsed time: {elapsed:.1f}s")
+    print(f"Pages fetched: {counters['pages_fetched']}")
+    print(f"Posts seen: {counters['posts_seen']}")
+    print(f"Image candidates: {counters['image_candidates']}")
+    print(f"Downloaded failures: {counters['download_failures']}")
+    print(f"Saved: {counters['saved']}")
+    print(f"Skipped (too small): {counters['skipped_too_small']}")
+    print(f"Skipped (no image): {counters['skipped_no_image']}")
+    print(f"Processing errors: {counters['processing_errors']}")
+    print("============\n")
 
 
 async def main():
@@ -347,6 +479,13 @@ async def main():
         default="./output_images",
         help="The destination folder for saved images (default: ./output_images).",
     )
+    parser.add_argument(
+        "--crop-mode",
+        type=str,
+        default="smart",
+        choices=["smart", "center"],
+        help="Crop strategy to use: smart saliency-based framing or center crop.",
+    )
     args = parser.parse_args()
 
     # 1. Setup output directory
@@ -357,7 +496,12 @@ async def main():
     try:
         # 2. Process the subreddit
         await process_subreddit(
-            args.subreddit, args.limit, args.sort, output_path, args.time
+            args.subreddit,
+            args.limit,
+            args.sort,
+            output_path,
+            args.time,
+            args.crop_mode,
         )
         logger.info("--- Scraping and processing complete! ---")
 

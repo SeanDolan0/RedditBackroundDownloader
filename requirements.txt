@@ -1,3 +1,4 @@
 httpx
-pillow
+numpy
+opencv-python
 tqdm
