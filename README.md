@@ -51,7 +51,6 @@ At the end of a run the tool prints a short summary with pages fetched, posts sc
 - If the output folder does not exist, it will be created automatically.
 **Contributing & License**
 - A local `.env` file is not required for the current version.
-If you want to publish this repository, add a `LICENSE` (MIT recommended) and initialize a Git repository. Contributions and enhancements (for example, adding `rich` for prettier console output) are welcome.
 
 ---
 
