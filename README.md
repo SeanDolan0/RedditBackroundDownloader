@@ -58,7 +58,3 @@ python scraper.py --subreddit EarthPorn --limit 20 --sort hot --crop-mode center
 - Filenames are sanitized for Windows and include the post id to reduce collisions.
 - If face detection is unavailable in the environment, the smart crop still falls back to saliency-based framing.
 - The script creates the output folder automatically if it does not exist.
-
-## Repository
-
-If you plan to publish this repo, add a license and initialize Git if you have not already.
