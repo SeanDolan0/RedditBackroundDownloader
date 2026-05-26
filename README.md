@@ -1,6 +1,6 @@
 # Reddit Background Downloader
 
-A small Python CLI that downloads high-resolution Reddit images, crops them for wallpaper use, and saves the results with Windows-safe filenames.
+A small Python CLI tool that downloads high-resolution Reddit images, crops them for wallpaper use, and saves the results with Windows-safe filenames.
 
 ## Features
 
