@@ -165,13 +165,8 @@ Reddit-downloader/
 ├── scraper.py              # Main script
 ├── requirements.txt        # Python dependencies
 ├── README.md              # This file
-├── QUICKSTART.md          # Quick start guide
-├── CLEANUP.md             # Output cleanup details
-├── DEMO.md                # Output examples
 ├── LICENSE                # License
-├── .gitignore             # Git exclusions
-├── output_images/         # Default output folder
-└── __pycache__/           # Python cache (ignored)
+└──.gitignore             # Git exclusions
 ```
 
 ## 🤝 Contributing
