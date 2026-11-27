@@ -3,6 +3,7 @@ import argparse
 import json
 import logging
 import re
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -21,7 +22,17 @@ TARGET_ASPECT_RATIO = 16.0 / 9.0
 # Resolution Guardrail: Minimum dimensions to consider an image valid for cropping.
 MIN_WIDTH = 2560
 MIN_HEIGHT = 1440
+# Aspect Guardrail: Minimum source width/height ratio (1.0 skips portrait images).
+MIN_ASPECT_RATIO = 1.0
 # -------------------------------
+
+# Windows consoles default to cp1252; make output UTF-8 so status glyphs
+# (checkmarks, emoji) can't crash printing. No-op where already UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except Exception:
+        pass
 
 # Setup logging and rich console
 logging.basicConfig(
@@ -81,6 +92,7 @@ def print_summary(counters: dict, elapsed: float):
     table.add_row("Download failures:", str(counters['download_failures']))
     table.add_row("✅ Successfully saved:", f"[green]{counters['saved']}[/green]")
     table.add_row("⏭️  Skipped (too small):", str(counters['skipped_too_small']))
+    table.add_row("⏭️  Skipped (portrait):", str(counters.get('skipped_aspect_ratio', 0)))
     table.add_row("⏭️  Skipped (blurry):", str(counters.get('skipped_blurry', 0)))
     table.add_row("⏭️  Skipped (existing):", str(counters.get('skipped_existing', 0)))
     table.add_row("⏭️  Skipped (duplicate):", str(counters.get('duplicates_skipped', 0)))
@@ -117,6 +129,13 @@ def print_error(title: str, message: str):
 
 # Shared HTTP settings for Reddit + image downloads.
 DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; RedditDownloader/1.0)"}
+
+# Reddit now returns 403 for unauthenticated JSON on www.reddit.com. Anonymous
+# visitors are instead issued a `token_v2` cookie that works as a Bearer token
+# against oauth.reddit.com. We warm up once to grab it, then send it ONLY on
+# Reddit API calls (never forwarded to image hosts).
+REDDIT_OAUTH_BASE = "https://oauth.reddit.com"
+_ANON_TOKEN: str | None = None
 DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=20.0)
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 DEFAULT_MAX_RETRIES = 3
@@ -177,6 +196,22 @@ async def download_image(
         return await _attempt(owned)
 
 
+async def _anonymous_oauth_token(client: httpx.AsyncClient) -> str | None:
+    """Return a cached anonymous Bearer token, warming up cookies if needed."""
+    global _ANON_TOKEN
+    if _ANON_TOKEN:
+        return _ANON_TOKEN
+    try:
+        await client.get("https://old.reddit.com/", follow_redirects=True)
+    except Exception:
+        return None
+    token = client.cookies.get("token_v2")
+    if token:
+        _ANON_TOKEN = token
+        return token
+    return None
+
+
 async def fetch_posts_from_json(
     subreddit_name: str,
     limit: int,
@@ -191,17 +226,23 @@ async def fetch_posts_from_json(
     Returns (children, after, ok). `ok` is False when the request ultimately
     failed after retries, so callers can tell a real error apart from a
     genuine "no more posts" (empty `children` with ok=True).
-    """
-    url = f"https://www.reddit.com/r/{subreddit_name}/{sort}.json?limit={limit}"
-    if sort == "top":
-        url = f"{url}&t={top_time}"
-    if after:
-        url = f"{url}&after={after}"
 
+    Uses Reddit's anonymous-OAuth route (`oauth.reddit.com` + `token_v2`
+    Bearer), since Reddit now blocks unauthenticated www.reddit.com JSON;
+    the request is still attempted if no token could be obtained.
+    """
     async def _attempt(c: httpx.AsyncClient) -> tuple[list, str | None, bool]:
+        token = await _anonymous_oauth_token(c)
+        url = f"{REDDIT_OAUTH_BASE}/r/{subreddit_name}/{sort}?limit={limit}&raw_json=1"
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        if sort == "top":
+            url = f"{url}&t={top_time}"
+        if after:
+            url = f"{url}&after={after}"
+
         for attempt in range(max_retries + 1):
             try:
-                response = await c.get(url)
+                response = await c.get(url, headers=headers)
             except httpx.HTTPError:
                 if attempt < max_retries:
                     await asyncio.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
@@ -313,20 +354,155 @@ def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
     return image
 
 
-def calculate_saliency_map(img: np.ndarray) -> np.ndarray:
-    """Compute a smoothed edge saliency map as float32 in [0, 1].
+SALIENCY_PROXY_MAX_SIDE = 512
 
-    Blurs first so meaningful edges win over noise, then normalizes
-    gradient magnitude to [0, 1].
+
+def _resize_to_proxy(
+    img: np.ndarray, max_side: int = SALIENCY_PROXY_MAX_SIDE
+) -> tuple[np.ndarray, float]:
+    """Downscale image so its longest side is <= max_side; return (resized, scale)."""
+    h, w = img.shape[:2]
+    long_side = max(w, h)
+    scale = min(1.0, float(max_side) / float(long_side))
+    if scale == 1.0:
+        return img, 1.0
+    pw = max(1, round(w * scale))
+    ph = max(1, round(h * scale))
+    return cv2.resize(img, (pw, ph), interpolation=cv2.INTER_AREA), scale
+
+
+def _normalize_robust(arr: np.ndarray, percentile: float = 99.5) -> np.ndarray:
+    """Normalize non-negative array to float32 [0, 1] using a high percentile."""
+    max_val = float(arr.max())
+    if max_val <= 1e-8:
+        return np.zeros(arr.shape, dtype=np.float32)
+    ref = float(np.percentile(arr, percentile))
+    denom = ref if ref > 1e-8 else max_val
+    out = np.clip(arr / denom, 0.0, 1.0).astype(np.float32)
+    cur_max = float(out.max())
+    if 0.0 < cur_max < 1.0:
+        out = np.clip(out / cur_max, 0.0, 1.0).astype(np.float32)
+    return out
+
+
+def _compute_proxy_saliency_and_edges(
+    proxy_bgr: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute (saliency, macro_edges, fine_edges) float32 maps in [0, 1] on a proxy image.
+
+    Combines CIE Lab global color/luminance uniqueness, multi-scale Lab
+    center-surround contrast, and texture-suppressed macro structure so
+    subjects stand out over repetitive grass, gravel, or water ripples.
     """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=5, sigmaY=5)
-    sobelx = cv2.Sobel(blurred, cv2.CV_32F, 1, 0, ksize=5)
-    sobely = cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=5)
-    magnitude = np.sqrt(sobelx**2 + sobely**2)
-    if magnitude.max() == 0.0:
-        return np.zeros(magnitude.shape, dtype=np.float32)
-    return magnitude / magnitude.max()
+    h, w = proxy_bgr.shape[:2]
+    short_side = max(1, min(h, w))
+
+    if int(proxy_bgr.max()) == int(proxy_bgr.min()):
+        zeros = np.zeros((h, w), dtype=np.float32)
+        return zeros, zeros, zeros
+
+    lab = cv2.cvtColor(proxy_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    sigma_fine_lab = max(1.0, 0.008 * short_side)
+    sigma_macro_lab = max(4.0, 0.06 * short_side)
+    lab_smooth = cv2.GaussianBlur(
+        lab, (0, 0), sigmaX=sigma_fine_lab, sigmaY=sigma_fine_lab
+    )
+    lab_macro = cv2.GaussianBlur(
+        lab, (0, 0), sigmaX=sigma_macro_lab, sigmaY=sigma_macro_lab
+    )
+
+    chroma_weights = np.array([1.0, 1.35, 1.35], dtype=np.float32)
+    med_lab = np.median(lab_smooth.reshape(-1, 3), axis=0)
+    sal_global = np.sqrt(np.sum(((lab_smooth - med_lab) ** 2) * chroma_weights, axis=2))
+    sal_surround = np.sqrt(
+        np.sum(((lab_smooth - lab_macro) ** 2) * chroma_weights, axis=2)
+    )
+
+    gray = cv2.cvtColor(proxy_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Use BORDER_REPLICATE so 1px-tall sliver inputs never fail Sobel border checks.
+    gx_f = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    gy_f = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    fine_mag = np.sqrt(gx_f ** 2 + gy_f ** 2)
+    sigma_density = max(1.5, 0.02 * short_side)
+    fine_density = cv2.GaussianBlur(
+        fine_mag, (0, 0), sigmaX=sigma_density, sigmaY=sigma_density
+    )
+
+    sigma_struct = max(1.5, 0.012 * short_side)
+    gray_macro = cv2.GaussianBlur(
+        gray, (0, 0), sigmaX=sigma_struct, sigmaY=sigma_struct
+    )
+    gx_m = cv2.Sobel(gray_macro, cv2.CV_32F, 1, 0, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    gy_m = cv2.Sobel(gray_macro, cv2.CV_32F, 0, 1, ksize=3, borderType=cv2.BORDER_REPLICATE)
+    macro_mag = np.sqrt(gx_m ** 2 + gy_m ** 2)
+
+    sal_global_n = _normalize_robust(sal_global)
+    sal_surround_n = _normalize_robust(sal_surround)
+    macro_n = _normalize_robust(macro_mag)
+    fine_n = _normalize_robust(fine_density)
+
+    # Suppress repetitive high-frequency texture without macro contrast (grass, ripples).
+    clutter_penalty = np.clip(
+        fine_n - 0.85 * macro_n - 0.5 * sal_surround_n, 0.0, 1.0
+    )
+    structure_n = np.clip(macro_n * (1.0 - 0.65 * clutter_penalty), 0.0, 1.0)
+
+    combined = (0.45 * sal_global_n + 0.35 * sal_surround_n + 0.20 * structure_n) * (
+        1.0 - 0.40 * clutter_penalty
+    )
+    saliency = _normalize_robust(combined)
+    return saliency, macro_n, fine_n
+
+
+def _estimate_sky_mask(proxy_bgr: np.ndarray, fine_n: np.ndarray) -> np.ndarray:
+    """Return a soft [0, 1] mask of likely sky regions in the upper scene."""
+    h, w = proxy_bgr.shape[:2]
+    if h < 16 or int(proxy_bgr.max()) == int(proxy_bgr.min()):
+        return np.zeros((h, w), dtype=np.float32)
+
+    hsv = cv2.cvtColor(proxy_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    val = hsv[:, :, 2] / 255.0
+    sat = hsv[:, :, 1] / 255.0
+    hue = hsv[:, :, 0]
+
+    lower_val = float(np.median(val[h // 2 :, :]))
+    upper_val = float(np.median(val[: max(1, h // 3), :]))
+    has_sky_brightness = upper_val > lower_val + 0.06
+    is_blue = (hue >= 85.0) & (hue <= 135.0) & (sat >= 0.12) & (val >= 0.25)
+    if not has_sky_brightness and float(is_blue[: max(1, h // 3), :].mean()) < 0.15:
+        return np.zeros((h, w), dtype=np.float32)
+
+    y_norm = np.linspace(1.0, 0.0, h, dtype=np.float32)[:, None]
+    upper_prior = np.clip((y_norm - 0.35) / 0.65, 0.0, 1.0)
+    smoothness = np.clip(1.0 - 2.0 * fine_n, 0.0, 1.0)
+    bright_or_blue = np.maximum(
+        np.clip((val - lower_val) / 0.35, 0.0, 1.0),
+        is_blue.astype(np.float32),
+    )
+    return (upper_prior * smoothness * bright_or_blue).astype(np.float32)
+
+
+def calculate_saliency_map(img: np.ndarray) -> np.ndarray:
+    """Compute a scale-invariant multi-cue saliency map as float32 in [0, 1].
+
+    Computes CIE Lab color/luminance uniqueness, center-surround contrast, and
+    texture-suppressed macro structure on a <=512px proxy, then upsamples back
+    to the input image dimensions.
+    """
+    orig_h, orig_w = img.shape[:2]
+    proxy, scale = _resize_to_proxy(img)
+    saliency_small, _, _ = _compute_proxy_saliency_and_edges(proxy)
+    if scale == 1.0:
+        return saliency_small
+    saliency_full = cv2.resize(
+        saliency_small, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR
+    ).astype(np.float32)
+    max_val = float(saliency_full.max())
+    if max_val <= 1e-8:
+        return np.zeros((orig_h, orig_w), dtype=np.float32)
+    if max_val < 1.0:
+        saliency_full = saliency_full / max_val
+    return np.clip(saliency_full, 0.0, 1.0).astype(np.float32)
 
 
 def integral_image(values: np.ndarray) -> np.ndarray:
@@ -418,32 +594,149 @@ def calculate_center_crop_box(
     return start_x, start_y, crop_w, crop_h
 
 
+def _weighted_window_saliency(
+    sal_int: np.ndarray,
+    px: int,
+    py: int,
+    pw: int,
+    ph: int,
+    free_axis: str,
+) -> float:
+    """Mean saliency weighted toward rule-of-thirds and center bands along free_axis."""
+    span = ph if free_axis == "y" else pw
+    if span < 5:
+        return box_mean_saliency(sal_int, px, py, pw, ph)
+
+    b0 = round(0.12 * span)
+    b1 = round(0.24 * span)
+    b3 = round(0.24 * span)
+    b4 = round(0.12 * span)
+    b2 = span - (b0 + b1 + b3 + b4)
+    bands = ((b0, 0.40), (b1, 1.15), (b2, 1.15), (b3, 1.15), (b4, 0.40))
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    offset = 0
+    for size, weight in bands:
+        if size <= 0:
+            continue
+        if free_axis == "y":
+            band_mean = box_mean_saliency(sal_int, px, py + offset, pw, size)
+        else:
+            band_mean = box_mean_saliency(sal_int, px + offset, py, size, ph)
+        weighted_sum += band_mean * size * weight
+        weight_total += size * weight
+        offset += size
+    return weighted_sum / weight_total if weight_total > 0 else 0.0
+
+
+def _expand_face_box(
+    face_box: tuple[int, int, int, int], img_w: int, img_h: int
+) -> tuple[int, int, int, int]:
+    """Expand a tight face box into a head-and-shoulders framing box."""
+    fx, fy, fw, fh = face_box
+    pad_x = round(0.35 * fw)
+    pad_top = round(0.45 * fh)
+    pad_bottom = round(0.75 * fh)
+    x1 = max(0, fx - pad_x)
+    y1 = max(0, fy - pad_top)
+    x2 = min(img_w, fx + fw + pad_x)
+    y2 = min(img_h, fy + fh + pad_bottom)
+    return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
+
+
 def calculate_best_crop_box(
     img: np.ndarray,
     target_aspect_ratio: float,
     face_cascade: cv2.CascadeClassifier | None = None,
     face_weight: float = 1.0,
 ) -> tuple[int, int, int, int]:
-    """Find a content-aware crop box that preserves the target aspect ratio.
+    """Find a composition-aware crop box preserving target_aspect_ratio.
 
-    The window slides along its free axis; each candidate position is scored
-    (mean saliency inside the window, plus face rewards) and the best wins.
-    The center candidate is seeded first, so ties favor the center.
-
-    `face_weight` scales all face rewards/penalties; 0.0 disables face-aware
-    framing (use for pure-landscape scenery), and `face_cascade=None` too.
+    Scores candidate positions along `free_axis` on a <=512px proxy using:
+    - Multi-cue Lab color/luminance + texture-suppressed saliency weighted toward
+      rule-of-thirds and center bands.
+    - Boundary-cut penalty to avoid slicing across salient structures/peaks.
+    - Sky/horizon balance when cropping vertically on landscapes.
+    - Soft center prior so noisy textures near edges do not hijack the frame.
+    - Head-and-shoulders face framing when face detection is enabled.
     """
     original_height, original_width = img.shape[:2]
     crop_w, crop_h, free_axis = build_crop_box(img, target_aspect_ratio)
+    ideal = (
+        ((original_width - crop_w) // 2, 0)
+        if free_axis == "x"
+        else (0, (original_height - crop_h) // 2)
+    )
 
-    saliency = calculate_saliency_map(img)
-    integral = integral_image(saliency)
+    proxy_bgr, scale = _resize_to_proxy(img)
+    proxy_h, proxy_w = proxy_bgr.shape[:2]
+    sal_small, macro_n, fine_n = _compute_proxy_saliency_and_edges(proxy_bgr)
+
     use_faces = face_cascade is not None and face_weight != 0.0
-    face_boxes = detect_faces(img, face_cascade) if use_faces else []
+    raw_faces = detect_faces(img, face_cascade) if use_faces else []
+    face_boxes = [_expand_face_box(b, original_width, original_height) for b in raw_faces]
+
+    if float(sal_small.max()) == 0.0 and not face_boxes:
+        return ideal[0], ideal[1], crop_w, crop_h
+
+    if free_axis == "x":
+        pw = max(1, min(round(crop_w * scale), proxy_w - 1 if proxy_w > 1 else 1))
+        ph = proxy_h
+        max_full = original_width - crop_w
+        max_proxy = proxy_w - pw
+    else:
+        pw = proxy_w
+        ph = max(1, min(round(crop_h * scale), proxy_h))
+        max_full = original_height - crop_h
+        max_proxy = proxy_h - ph
+
+    sal_int = integral_image(sal_small)
+    edge_map = np.maximum(macro_n, 0.6 * sal_small).astype(np.float32)
+    edge_int = integral_image(edge_map)
+
+    sky_int: np.ndarray | None = None
+    if free_axis == "y":
+        sky_mask = _estimate_sky_mask(proxy_bgr, fine_n)
+        if float(sky_mask.mean()) > 0.03:
+            sky_int = integral_image(sky_mask)
+
+    span = ph if free_axis == "y" else pw
+    strip = max(2, round(0.03 * span)) if span >= 6 else 0
     margin = 0.05 * min(crop_w, crop_h)
 
-    def score_box(start_x: int, start_y: int) -> float:
-        score = box_mean_saliency(integral, start_x, start_y, crop_w, crop_h)
+    def score_candidate(start_x: int, start_y: int) -> float:
+        if max_proxy > 0 and max_full > 0:
+            pos_full = start_x if free_axis == "x" else start_y
+            pos_proxy = min(max_proxy, max(0, round(pos_full * max_proxy / max_full)))
+        else:
+            pos_proxy = 0
+        px, py = (pos_proxy, 0) if free_axis == "x" else (0, pos_proxy)
+
+        score = _weighted_window_saliency(sal_int, px, py, pw, ph, free_axis)
+
+        if strip > 0:
+            if free_axis == "y":
+                edge_start = box_mean_saliency(edge_int, px, py, pw, strip)
+                edge_end = box_mean_saliency(edge_int, px, py + ph - strip, pw, strip)
+            else:
+                edge_start = box_mean_saliency(edge_int, px, py, strip, ph)
+                edge_end = box_mean_saliency(edge_int, px + pw - strip, py, strip, ph)
+            score -= 0.30 * (edge_start + edge_end)
+
+        if sky_int is not None:
+            sky_frac = box_mean_saliency(sky_int, px, py, pw, ph)
+            score += 0.15 * min(sky_frac / 0.22, 1.0)
+            if sky_frac < 0.05:
+                score -= 0.12
+
+        if max_full > 0:
+            ideal_pos = ideal[0] if free_axis == "x" else ideal[1]
+            cur_pos = start_x if free_axis == "x" else start_y
+            half_range = max(1.0, max_full / 2.0)
+            norm_dist = abs(cur_pos - ideal_pos) / half_range
+            score -= 0.015 * norm_dist + 0.08 * (norm_dist ** 2)
+
         for face_x, face_y, face_w, face_h in face_boxes:
             face_right = face_x + face_w
             face_bottom = face_y + face_h
@@ -471,19 +764,21 @@ def calculate_best_crop_box(
                 score -= (10.0 if partially_clipped else 2.0) * face_weight
         return score
 
-    if free_axis == "x":
-        candidates = [(start_x, 0) for start_x in range(0, original_width - crop_w + 1)]
-        ideal = ((original_width - crop_w) // 2, 0)
-    else:
-        candidates = [(0, start_y) for start_y in range(0, original_height - crop_h + 1)]
-        ideal = (0, (original_height - crop_h) // 2)
+    # Build candidate positions in full-res from each proxy step, plus exact center.
+    seen_pos: set[tuple[int, int]] = {ideal}
+    candidates: list[tuple[int, int]] = []
+    if max_proxy > 0:
+        for p in range(max_proxy + 1):
+            full_p = min(max_full, round(p * max_full / max_proxy)) if max_full > 0 else 0
+            cand = (full_p, 0) if free_axis == "x" else (0, full_p)
+            if cand not in seen_pos:
+                seen_pos.add(cand)
+                candidates.append(cand)
 
     best_start = ideal
-    best_score = score_box(*ideal)
+    best_score = score_candidate(*ideal)
     for start_x, start_y in candidates:
-        if (start_x, start_y) == ideal:
-            continue
-        score = score_box(start_x, start_y)
+        score = score_candidate(start_x, start_y)
         if score > best_score:
             best_score = score
             best_start = (start_x, start_y)
@@ -506,6 +801,7 @@ def crop_and_save_image(
     min_sharpness: float = 0.0,
     min_width: int = MIN_WIDTH,
     min_height: int = MIN_HEIGHT,
+    min_aspect_ratio: float = MIN_ASPECT_RATIO,
     skip_existing: bool = False,
     seen_hashes: set[int] | None = None,
     metadata: dict | None = None,
@@ -519,10 +815,13 @@ def crop_and_save_image(
         pulling - best for pure scenery).
 
     Returns (ok, reason); reason is one of:
-      saved | too_small | too_blurry | exists | duplicate | format_error | error.
+      saved | too_small | bad_aspect | too_blurry | exists | duplicate | format_error | error.
     """
     try:
         image = decode_image_bytes(image_bytes)
+        orig_h, orig_w = image.shape[:2]
+        if min_aspect_ratio > 0.0 and (orig_w / orig_h) < min_aspect_ratio:
+            return False, "bad_aspect"
 
         # Choose crop aspect. With --target-resolution, crop to match it.
         target_aspect_ratio = TARGET_ASPECT_RATIO
@@ -533,6 +832,15 @@ def crop_and_save_image(
                 return False, "error"
             target_aspect_ratio = out_w_req / out_h_req
             out_size = (out_w_req, out_h_req)
+
+        # Resolution & no-upscale guardrails BEFORE expensive saliency/face scoring.
+        crop_w, crop_h, _ = build_crop_box(image, target_aspect_ratio)
+        if crop_w < min_width or crop_h < min_height:
+            return False, "too_small"
+        if out_size is not None and not allow_upscale and (
+            crop_w < out_size[0] or crop_h < out_size[1]
+        ):
+            return False, "too_small"
 
         use_face = face_cascade if crop_mode == "smart" and face_weight != 0.0 else None
         effective_face_weight = face_weight if crop_mode == "smart" else 0.0
@@ -546,10 +854,6 @@ def crop_and_save_image(
             start_x, start_y, crop_w, crop_h = calculate_best_crop_box(
                 image, target_aspect_ratio, use_face, effective_face_weight
             )
-
-        # Resolution guardrail on the SOURCE crop (image quality).
-        if crop_w < min_width or crop_h < min_height:
-            return False, "too_small"
 
         # Perform the crop.
         cropped_image = image[start_y : start_y + crop_h, start_x : start_x + crop_w]
@@ -566,9 +870,6 @@ def crop_and_save_image(
         final_image = cropped_image
         if out_size is not None:
             out_w, out_h = out_size
-            # No-upscale policy: refuse to invent pixels unless allowed.
-            if not allow_upscale and (crop_w < out_w or crop_h < out_h):
-                return False, "too_small"
             downscaling = out_w <= crop_w and out_h <= crop_h
             interp = cv2.INTER_AREA if downscaling else cv2.INTER_LANCZOS4
             final_image = cv2.resize(final_image, (out_w, out_h), interpolation=interp)
@@ -661,6 +962,7 @@ async def process_subreddit(
     min_sharpness: float = 0.0,
     min_width: int = MIN_WIDTH,
     min_height: int = MIN_HEIGHT,
+    min_aspect_ratio: float = MIN_ASPECT_RATIO,
     skip_existing: bool = False,
     no_duplicates: bool = False,
     write_metadata: bool = False,
@@ -694,6 +996,7 @@ async def process_subreddit(
         "download_failures": 0,
         "saved": 0,
         "skipped_too_small": 0,
+        "skipped_aspect_ratio": 0,
         "skipped_blurry": 0,
         "skipped_existing": 0,
         "duplicates_skipped": 0,
@@ -765,6 +1068,22 @@ async def process_subreddit(
                     continue
                 counters["image_candidates"] += 1
 
+                # Pre-download orientation/aspect guardrail using Reddit preview metadata.
+                if min_aspect_ratio > 0.0:
+                    preview_images = post.get("preview", {}).get("images", [])
+                    if preview_images:
+                        src = preview_images[0].get("source", {})
+                        src_w, src_h = src.get("width"), src.get("height")
+                        if (
+                            isinstance(src_w, (int, float))
+                            and isinstance(src_h, (int, float))
+                            and src_w > 0
+                            and src_h > 0
+                            and (src_w / src_h) < min_aspect_ratio
+                        ):
+                            counters["skipped_aspect_ratio"] += 1
+                            continue
+
                 # --skip-existing: don't even download if this post id already saved.
                 if skip_existing and post_id:
                     safe_title = sanitize_filename(post.get("title", "UntitledPost"))[:50]
@@ -814,6 +1133,7 @@ async def process_subreddit(
                     min_sharpness=min_sharpness,
                     min_width=min_width,
                     min_height=min_height,
+                    min_aspect_ratio=min_aspect_ratio,
                     skip_existing=skip_existing,
                     seen_hashes=seen_hashes,
                     metadata=metadata,
@@ -827,6 +1147,8 @@ async def process_subreddit(
                     print_status(f"Saved image {saved_images}/{limit}", "success")
                 elif reason == "too_small":
                     counters["skipped_too_small"] += 1
+                elif reason == "bad_aspect":
+                    counters["skipped_aspect_ratio"] += 1
                 elif reason == "too_blurry":
                     counters["skipped_blurry"] += 1
                 elif reason == "exists":
@@ -910,6 +1232,11 @@ def run_interactive_mode():
     else:
         crop_mode = "smart"
 
+    allow_portrait = questionary.confirm(
+        "Allow portrait images (width < height) to be cropped to 16:9?",
+        default=False,
+    ).ask()
+
     output = questionary.text(
         "Output folder?",
         default="./output_images"
@@ -923,6 +1250,7 @@ def run_interactive_mode():
         "sort": sort,
         "time": time_filter,
         "crop_mode": crop_mode,
+        "allow_portrait": bool(allow_portrait),
         "output": output,
     }
 
@@ -953,6 +1281,7 @@ async def main(
     min_sharpness: float = 0.0,
     min_width: int = MIN_WIDTH,
     min_height: int = MIN_HEIGHT,
+    min_aspect_ratio: float = MIN_ASPECT_RATIO,
     skip_existing: bool = False,
     no_duplicates: bool = False,
     write_metadata: bool = False,
@@ -984,6 +1313,7 @@ async def main(
             min_sharpness=min_sharpness,
             min_width=min_width,
             min_height=min_height,
+            min_aspect_ratio=min_aspect_ratio,
             skip_existing=skip_existing,
             no_duplicates=no_duplicates,
             write_metadata=write_metadata,
@@ -1100,6 +1430,17 @@ Examples:
         help=f"Source-crop minimum height in px (default: {MIN_HEIGHT}).",
     )
     parser.add_argument(
+        "--min-aspect-ratio",
+        type=float,
+        default=MIN_ASPECT_RATIO,
+        help=f"Minimum source width/height ratio before cropping; 0 disables (default: {MIN_ASPECT_RATIO}).",
+    )
+    parser.add_argument(
+        "--allow-portrait",
+        action="store_true",
+        help="Allow portrait images (width < height) to be cropped; sets --min-aspect-ratio to 0.",
+    )
+    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip posts already saved in the output folder (match by post id); don't re-download or overwrite.",
@@ -1140,6 +1481,7 @@ Examples:
         time_filter = config["time"]
         crop_mode = config["crop_mode"]
         output = config["output"]
+        min_aspect_ratio = 0.0 if config.get("allow_portrait") else args.min_aspect_ratio
     else:
         # Validate required argument
         if not args.subreddit:
@@ -1153,6 +1495,7 @@ Examples:
         time_filter = args.time
         crop_mode = args.crop_mode
         output = args.output
+        min_aspect_ratio = 0.0 if args.allow_portrait else args.min_aspect_ratio
 
     # Run the async main function
     asyncio.run(
@@ -1170,6 +1513,7 @@ Examples:
             min_sharpness=args.min_sharpness,
             min_width=args.min_width,
             min_height=args.min_height,
+            min_aspect_ratio=min_aspect_ratio,
             skip_existing=args.skip_existing,
             no_duplicates=args.no_duplicates,
             write_metadata=args.write_metadata,

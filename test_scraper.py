@@ -130,6 +130,42 @@ def test_best_crop_captures_more_saliency_than_center_on_subject():
     assert cap(bx) >= cap(cx) - 1e-6
 
 
+def test_best_crop_captures_off_center_colorful_subject():
+    # Dark muted frame with vivid orange subject on the far left.
+    img = np.full((1080, 3000, 3), (45, 45, 45), np.uint8)
+    cv2.rectangle(img, (150, 250), (650, 830), (30, 140, 245), -1)
+    cx = scraper.calculate_center_crop_box(img, AR)
+    bx = scraper.calculate_best_crop_box(img, AR, None)
+    # Center crop (x=540..2460) clips most of the subject; smart crop shifts left.
+    assert bx[0] < cx[0]
+    assert bx[0] <= 150 <= bx[0] + bx[2]
+
+
+def test_best_crop_prefers_mountain_and_sky_over_foreground_grass():
+    rng = np.random.default_rng(42)
+    img = np.zeros((2000, 1500, 3), np.uint8)
+    img[:750, :] = (230, 170, 90)  # blue sky
+    pts = np.array([[0, 1200], [450, 700], [750, 425], [1100, 750], [1500, 1200]])
+    cv2.fillPoly(img, [pts], (95, 85, 80))
+    cap = np.array([[600, 570], [750, 425], [910, 575]])
+    cv2.fillPoly(img, [cap], (245, 245, 250))
+    img[1200:, :] = rng.integers(10, 180, (800, 1500, 3), np.uint8)  # noisy grass
+
+    x, y, w, h = scraper.calculate_best_crop_box(img, AR, None)
+    # Peak at y=425 must stay comfortably inside the crop rather than chasing bottom grass.
+    assert y <= 425
+    assert y + h < 1650
+
+
+def test_best_crop_avoids_clipping_tall_spire_at_top_edge():
+    rng = np.random.default_rng(7)
+    img = np.full((1800, 1500, 3), (240, 220, 200), np.uint8)  # bright sky
+    img[800:, :] = rng.integers(30, 120, (1000, 1500, 3), np.uint8)  # textured canyon
+    cv2.rectangle(img, (700, 200), (800, 1600), (60, 140, 220), -1)  # warm spire
+    _, y, _, _ = scraper.calculate_best_crop_box(img, AR, None)
+    assert y < 200  # spire tip at y=200 is not clipped at the top border
+
+
 # ---------- faces ----------
 def test_detect_faces_scaling_back_with_stub():
     img = make_img(4000, 3000, kind="flat")
@@ -278,6 +314,20 @@ def test_too_small_respects_min_override(tmp_path):
         min_width=99999, min_height=99999,
     )
     assert (ok, reason) == (False, "too_small")
+
+
+def test_portrait_skipped_by_default_and_allowed_when_disabled(tmp_path):
+    portrait = png_bytes(make_img(2600, 3900, kind="noise", seed=14))
+    ok_skip, reason_skip = scraper.crop_and_save_image(
+        portrait, tmp_path, "portrait", "p1", None, "smart", min_width=0, min_height=0
+    )
+    assert (ok_skip, reason_skip) == (False, "bad_aspect")
+
+    ok_allow, reason_allow = scraper.crop_and_save_image(
+        portrait, tmp_path, "portrait", "p2", None, "smart",
+        min_width=0, min_height=0, min_aspect_ratio=0.0,
+    )
+    assert (ok_allow, reason_allow) == (True, "saved")
 
 
 def test_format_error_on_garbage(tmp_path):
@@ -495,7 +545,9 @@ def test_process_subreddit_concurrent_mocked(tmp_path, monkeypatch):
     img_png = png_bytes(make_img(3000, 2000, kind="noise", seed=13))
 
     def handler(request):
-        if request.url.host == "www.reddit.com":
+        if request.url.host in {"oauth.reddit.com", "old.reddit.com"}:
+            if request.url.host == "old.reddit.com":
+                return httpx.Response(200, content=b"")
             children = [
                 _post("p1", "https://i.redd.it/a.jpg"),
                 _post("p2", "https://i.redd.it/b.jpg"),
@@ -528,3 +580,45 @@ def test_process_subreddit_concurrent_mocked(tmp_path, monkeypatch):
     assert len(saved) == 2, saved
     assert all(n.endswith(".jpg") for n in saved)
     assert len(list(tmp_path.glob("*.json"))) == 2  # attribution sidecars
+
+
+def test_process_subreddit_skips_portrait_preview_before_download(tmp_path, monkeypatch):
+    downloaded_urls = []
+    img_png = png_bytes(make_img(3000, 2000, kind="noise", seed=15))
+
+    def handler(request):
+        if request.url.host in {"oauth.reddit.com", "old.reddit.com"}:
+            if request.url.host == "old.reddit.com":
+                return httpx.Response(200, content=b"")
+            children = [
+                _post(
+                    "portrait1",
+                    "https://i.redd.it/tall.jpg",
+                    preview={"images": [{"source": {"url": "https://i.redd.it/tall.jpg", "width": 3000, "height": 4500}}]},
+                ),
+                _post(
+                    "land1",
+                    "https://i.redd.it/wide.jpg",
+                    preview={"images": [{"source": {"url": "https://i.redd.it/wide.jpg", "width": 3000, "height": 2000}}]},
+                ),
+            ]
+            return httpx.Response(200, json={"data": {"children": children, "after": None}})
+        downloaded_urls.append(str(request.url))
+        return httpx.Response(200, content=img_png)
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    def client_factory(*args, **kwargs):
+        kwargs.pop("transport", None)
+        return real_client(transport=transport, **kwargs)
+    monkeypatch.setattr(scraper.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(scraper, "load_face_cascade", lambda: None)
+
+    asyncio.run(
+        scraper.process_subreddit(
+            "EarthPorn", 10, "hot", tmp_path, "all", "smart",
+            concurrency=2, min_width=0, min_height=0,
+        )
+    )
+    assert downloaded_urls == ["https://i.redd.it/wide.jpg"]
+    assert len(list(tmp_path.glob("*.jpg"))) == 1
