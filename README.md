@@ -26,8 +26,8 @@ Two output modes are supported: a native-resolution 16:9 crop at the source's fu
 ## Installation
 
 ```bash
-git clone https://github.com/SeanDolan0/Reddit-backround-downloader.git
-cd Reddit-backround-downloader
+git clone https://github.com/SeanDolan0/RedditBackroundDownloader.git
+cd RedditBackroundDownloader
 
 # optional but recommended
 python -m venv .venv
@@ -187,7 +187,7 @@ python -m pytest -q
 ## Project layout
 
 ```
-Reddit-backround-downloader/
+RedditBackroundDownloader/
 ├── scraper.py                   # Main CLI + cropping + download pipeline
 ├── test_scraper.py              # pytest suite
 ├── requirements.txt             # Python dependencies
