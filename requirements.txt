@@ -1,5 +1,6 @@
 httpx
 numpy
-opencv-python
+opencv-python<5
 rich
 questionary
+pytest

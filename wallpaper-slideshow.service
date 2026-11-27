@@ -1,0 +1,10 @@
+[Unit]
+Description=KDE per-screen wallpaper slideshow (hourly rotation)
+After=plasma-plasmashell.service
+
+[Service]
+Type=oneshot
+# adjust path + image dir
+ExecStart=%h/Projects/RedditBackroundDownloader/wallpaper_slideshow.sh %h/Projects/RedditBackroundDownloader/output_images
+# point QDBUS at qdbus6 if needed; set FILL_MODE etc:
+Environment=FILL_MODE=2
